@@ -44,7 +44,7 @@
 # - A C toolchain for CGO (Xcode CLI tools on macOS, MSYS2/MinGW or WSL on Windows)
 
 # clone and enter (replace with your repo path)
-$ git clone git@github.com:yourname/crm-term.git
+$ git clone git@github.com:Azteriisk/crm-term.git
 $ cd crm-term
 
 # run directly
