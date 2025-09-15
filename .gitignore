@@ -1,0 +1,25 @@
+# Build artifacts
+/crm-term
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Go build cache / binaries
+*.out
+coverage.txt
+
+# Editor clutter
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Dependency / module vendor directories
+vendor/
+
+# Local tooling
+.tools/
