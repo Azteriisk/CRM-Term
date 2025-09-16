@@ -74,6 +74,14 @@ type ImportResult struct {
 	Created int
 	Skipped int
 	Errors  []string
+	Notes   int
+}
+
+// CleanupResult summarises data deletion counts.
+type CleanupResult struct {
+	Accounts int64
+	Notes    int64
+	Events   int64
 }
 
 var (
@@ -453,10 +461,25 @@ func (s *Store) ImportAccountsCSV(ctx context.Context, r io.Reader, defaultCreat
 	}
 	index := map[string]int{}
 	for i, h := range header {
-		key := strings.ToLower(strings.TrimSpace(h))
-		if key != "" {
-			index[key] = i
+		key := normalizeHeader(h)
+		if key == "" {
+			continue
 		}
+		switch key {
+		case "accountname":
+			key = "name"
+		case "phonenumber":
+			key = "phone"
+		case "decisionmaker", "dm":
+			key = "decision_maker"
+		case "created", "createddate", "createdtime":
+			key = "created_at"
+		case "notes":
+			key = "note"
+		case "mail", "emailaddress":
+			key = "email"
+		}
+		index[key] = i
 	}
 	nameIdx, ok := index["name"]
 	if !ok {
@@ -534,6 +557,109 @@ func (s *Store) ImportAccountsCSV(ctx context.Context, r io.Reader, defaultCreat
 			continue
 		}
 		result.Created++
+		if idx, ok := index["note"]; ok && idx < len(record) {
+			note := strings.TrimSpace(record[idx])
+			if note != "" {
+				accountNote := Note{
+					Content:   note,
+					AccountID: sql.NullInt64{Int64: account.ID, Valid: true},
+					Creator:   creator,
+					CreatedAt: account.CreatedAt,
+				}
+				if err := s.CreateNote(ctx, &accountNote); err != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("row %d: note error: %v", row, err))
+				} else {
+					result.Notes++
+				}
+			}
+		}
+	}
+	return result, nil
+}
+
+// DeleteBefore removes accounts, notes, and events created before the cutoff.
+func (s *Store) DeleteBefore(ctx context.Context, cutoff time.Time) (CleanupResult, error) {
+	if cutoff.IsZero() {
+		return CleanupResult{}, nil
+	}
+	args := cutoff.UTC().Format(time.RFC3339)
+	return s.deleteByQueries(ctx,
+		deleteQuery{"notes", "DELETE FROM notes WHERE created_at < ?", args},
+		deleteQuery{"events", "DELETE FROM events WHERE created_at < ?", args},
+		deleteQuery{"accounts", "DELETE FROM accounts WHERE created_at < ?", args},
+	)
+}
+
+// DeleteOldest removes the oldest N accounts, notes, and events.
+func (s *Store) DeleteOldest(ctx context.Context, limit int) (CleanupResult, error) {
+	if limit <= 0 {
+		return CleanupResult{}, nil
+	}
+	return s.deleteByQueries(ctx,
+		deleteQuery{"notes", "DELETE FROM notes WHERE id IN (SELECT id FROM notes ORDER BY created_at ASC LIMIT ?)", limit},
+		deleteQuery{"events", "DELETE FROM events WHERE id IN (SELECT id FROM events ORDER BY created_at ASC LIMIT ?)", limit},
+		deleteQuery{"accounts", "DELETE FROM accounts WHERE id IN (SELECT id FROM accounts ORDER BY created_at ASC LIMIT ?)", limit},
+	)
+}
+
+// DeleteRange removes entries between start and end (inclusive on start, exclusive on end if provided).
+func (s *Store) DeleteRange(ctx context.Context, start, end time.Time) (CleanupResult, error) {
+	if start.IsZero() && end.IsZero() {
+		return CleanupResult{}, nil
+	}
+	args := []interface{}{}
+	var where string
+	if !start.IsZero() && !end.IsZero() {
+		where = "created_at >= ? AND created_at < ?"
+		args = append(args, start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
+	} else if !start.IsZero() {
+		where = "created_at >= ?"
+		args = append(args, start.UTC().Format(time.RFC3339))
+	} else {
+		where = "created_at < ?"
+		args = append(args, end.UTC().Format(time.RFC3339))
+	}
+	notesArgs := append([]interface{}(nil), args...)
+	eventsArgs := append([]interface{}(nil), args...)
+	accountsArgs := append([]interface{}(nil), args...)
+	return s.deleteByQueries(ctx,
+		deleteQuery{"notes", fmt.Sprintf("DELETE FROM notes WHERE %s", where), notesArgs},
+		deleteQuery{"events", fmt.Sprintf("DELETE FROM events WHERE %s", where), eventsArgs},
+		deleteQuery{"accounts", fmt.Sprintf("DELETE FROM accounts WHERE %s", where), accountsArgs},
+	)
+}
+
+type deleteQuery struct {
+	entity string
+	query  string
+	args   interface{}
+}
+
+func (s *Store) deleteByQueries(ctx context.Context, queries ...deleteQuery) (CleanupResult, error) {
+	var result CleanupResult
+	for _, q := range queries {
+		var res sql.Result
+		var err error
+		switch args := q.args.(type) {
+		case []interface{}:
+			res, err = s.db.ExecContext(ctx, q.query, args...)
+		case interface{}:
+			res, err = s.db.ExecContext(ctx, q.query, args)
+		default:
+			res, err = s.db.ExecContext(ctx, q.query)
+		}
+		if err != nil {
+			return result, fmt.Errorf("delete %s: %w", q.entity, err)
+		}
+		af, _ := res.RowsAffected()
+		switch q.entity {
+		case "accounts":
+			result.Accounts += af
+		case "notes":
+			result.Notes += af
+		case "events":
+			result.Events += af
+		}
 	}
 	return result, nil
 }
@@ -566,6 +692,11 @@ func nullStringToString(ns sql.NullString) string {
 		return ns.String
 	}
 	return ""
+}
+
+func normalizeHeader(h string) string {
+	replacer := strings.NewReplacer(" ", "", "_", "", "-", "", ".", "", "/", "")
+	return replacer.Replace(strings.ToLower(strings.TrimSpace(h)))
 }
 
 func parseImportTime(value string, loc *time.Location) (time.Time, bool) {

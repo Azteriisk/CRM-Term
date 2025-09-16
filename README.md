@@ -72,7 +72,9 @@ Main Menu
 
 ### Keyboard Shortcuts By Screen
 - **Dashboard** – type `t` then Enter to toggle Activity view; `r` + Enter to refresh.
-- **Account search** – keep typing to filter; Enter accepts the search; `/` or `exit.` exits.
+- **Account search** – keep typing to filter; Enter accepts the search; `/` or `exit.` exits. Press `1`, `2`, etc. (or type a fuzzy name) to open a numbered account from the list.
+- **Debug cleanup** – press `Ctrl+D` from anywhere to open the debug panel and purge test data (older than 1 week, oldest 500, custom range, etc.).
+- **Bulk import** – type `import path/to/import_example.csv` in the account list to ingest accounts from a CSV.
 - **Create note/event** – blank optional answers are OK; `YYYY-MM-DD HH:MM` timestamps respect your timezone.
 - **Settings** – type `1`/`2` or partial words (`nam`, `tz`) to edit name or timezone.
 
@@ -86,6 +88,22 @@ Main Menu
 | `crmterm.db` | SQLite database with tables: `accounts`, `notes`, `events`. |
 
 All timestamps are stored in UTC. Rendering converts to the timezone stored in `config.json`.
+
+## CSV Import
+The importer expects a header row (case and spacing ignored). Recognised columns:
+
+| Column | Purpose |
+| ------ | ------- |
+| `Account Name` | Required account name. |
+| `Address` | Optional postal address. |
+| `Phone` | Optional phone number. |
+| `DM` | Decision-maker / main contact. |
+| `Email` | Primary email address. |
+| `Note` | Optional note; creates a linked note automatically. |
+| `Creator` | Overrides the creator name (defaults to your configured name). |
+| `Created At` | Timestamp for the account (RFC3339 or `YYYY-MM-DD HH:MM`). |
+
+Example command: `import import_example.csv`
 
 ## Architecture Sketch
 ```

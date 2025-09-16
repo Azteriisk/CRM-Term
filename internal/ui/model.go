@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -59,6 +60,8 @@ const (
 	stateSettings
 	stateSettingsEditName
 	stateSettingsEditTimezone
+	stateSettingsImport
+	stateDebug
 )
 
 const (
@@ -70,6 +73,7 @@ const (
 	settingsViewing settingsMode = iota
 	settingsEditingName
 	settingsEditingTimezone
+	settingsImportPath
 )
 
 const (
@@ -91,6 +95,15 @@ type accountDetailView int
 const (
 	accountDetailSummary accountDetailView = iota
 	accountDetailActivity
+)
+
+type debugMode int
+
+const (
+	debugViewing debugMode = iota
+	debugConfirm
+	debugRangeStart
+	debugRangeEnd
 )
 
 type model struct {
@@ -121,6 +134,8 @@ type model struct {
 	settings settingsModel
 
 	accountDetail accountDetailModel
+
+	debug debugModel
 }
 
 type accountForm struct {
@@ -177,6 +192,16 @@ type accountDetailModel struct {
 	activity []storage.Activity
 	view     accountDetailView
 	err      string
+}
+
+type debugModel struct {
+	mode       debugMode
+	input      textinput.Model
+	startInput textinput.Model
+	endInput   textinput.Model
+	err        string
+	rangeStart time.Time
+	rangeEnd   time.Time
 }
 
 type menuOption struct {
@@ -294,6 +319,9 @@ func newModel(store *storage.Store, cfg *config.Store) *model {
 		dashboard:     dashboardModel{view: dashboardEvents},
 		settings:      settingsModel{mode: settingsViewing, input: textinput.New()},
 		showSplash:    true,
+		debug: debugModel{
+			mode: debugViewing,
+		},
 	}
 	m.settings.input.Prompt = ""
 	m.settings.input.CharLimit = 64
@@ -301,6 +329,15 @@ func newModel(store *storage.Store, cfg *config.Store) *model {
 	m.accountForm = newAccountForm(nil)
 	m.noteWizard = newNoteWizard(nil)
 	m.eventWizard = newEventWizard(nil)
+	m.debug.input = textinput.New()
+	m.debug.input.Placeholder = "Choose an option"
+	m.debug.input.CharLimit = 64
+	m.debug.startInput = textinput.New()
+	m.debug.startInput.Placeholder = "Start YYYY-MM-DD"
+	m.debug.startInput.CharLimit = 32
+	m.debug.endInput = textinput.New()
+	m.debug.endInput.Placeholder = "End YYYY-MM-DD"
+	m.debug.endInput.CharLimit = 32
 	m.refreshDashboard(now)
 	m.refreshAccounts()
 	return &m
@@ -408,8 +445,11 @@ func (m *model) Init() tea.Cmd {
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if msg.Type == tea.KeyCtrlC {
+		switch msg.Type {
+		case tea.KeyCtrlC:
 			return m, tea.Quit
+		case tea.KeyCtrlD:
+			return m, m.openDebugMenu()
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -434,8 +474,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = m.updateEventWizard(msg)
 	case stateDashboard:
 		cmd = m.updateDashboard(msg)
-	case stateSettings, stateSettingsEditName, stateSettingsEditTimezone:
+	case stateSettings, stateSettingsEditName, stateSettingsEditTimezone, stateSettingsImport:
 		cmd = m.updateSettings(msg)
+	case stateDebug:
+		cmd = m.updateDebug(msg)
 	default:
 		m.state = stateMainMenu
 		cmd = m.updateMainMenu(msg)
@@ -461,8 +503,10 @@ func (m *model) View() string {
 		return m.viewEventWizard()
 	case stateDashboard:
 		return m.viewDashboard()
-	case stateSettings, stateSettingsEditName, stateSettingsEditTimezone:
+	case stateSettings, stateSettingsEditName, stateSettingsEditTimezone, stateSettingsImport:
 		return m.viewSettings()
+	case stateDebug:
+		return m.viewDebug()
 	default:
 		return ""
 	}
@@ -626,6 +670,79 @@ func resolveAccountDetailAction(input string) (string, bool) {
 	return "", false
 }
 
+func extractTrailingNumber(value string) (base string, index int, ok bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", 0, false
+	}
+	end := len(trimmed)
+	for end > 0 {
+		r := rune(trimmed[end-1])
+		if !unicode.IsDigit(r) {
+			break
+		}
+		end--
+	}
+	if end == len(trimmed) {
+		return trimmed, 0, false
+	}
+	numStr := trimmed[end:]
+	base = strings.TrimSpace(trimmed[:end])
+	n, err := strconv.Atoi(numStr)
+	if err != nil {
+		return trimmed, 0, false
+	}
+	return base, n, true
+}
+
+func (m *model) runCleanupBefore(duration time.Duration, label string) {
+	cutoff := time.Now().Add(-duration)
+	res, err := m.store.DeleteBefore(context.Background(), cutoff)
+	m.applyCleanupResult(res, err, fmt.Sprintf("Cleared items %s", label))
+}
+
+func (m *model) runCleanupOldest(limit int) {
+	res, err := m.store.DeleteOldest(context.Background(), limit)
+	m.applyCleanupResult(res, err, fmt.Sprintf("Removed oldest %d entries", limit))
+}
+
+func (m *model) runCleanupRange() {
+	res, err := m.store.DeleteRange(context.Background(), m.debug.rangeStart, m.debug.rangeEnd)
+	m.applyCleanupResult(res, err, "Deleted records in range")
+	m.debug.mode = debugViewing
+	m.debug.startInput.SetValue("")
+	m.debug.endInput.SetValue("")
+}
+
+func (m *model) applyCleanupResult(res storage.CleanupResult, err error, label string) {
+	if err != nil {
+		m.debug.err = err.Error()
+		return
+	}
+	m.debug.err = ""
+	m.infoMessage = fmt.Sprintf("%s — accounts:%d notes:%d events:%d", label, res.Accounts, res.Notes, res.Events)
+	m.refreshDataAfterCleanup()
+}
+
+func (m *model) refreshDataAfterCleanup() {
+	m.refreshAccounts()
+	m.refreshDashboard(time.Now().In(m.cfg.Location()))
+	if m.accountDetail.account.ID != 0 {
+		m.refreshAccountDetailAccount()
+		m.loadAccountActivity()
+	}
+}
+
+func parseDateInput(value string, loc *time.Location) (time.Time, error) {
+	layouts := []string{"2006-01-02", time.RFC3339, "2006-01-02 15:04"}
+	for _, layout := range layouts {
+		if t, err := time.ParseInLocation(layout, value, loc); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unsupported date format")
+}
+
 func (m *model) openAccountDetail(account storage.Account) tea.Cmd {
 	m.accountDetail.account = account
 	m.accountDetail.view = accountDetailSummary
@@ -689,6 +806,9 @@ func (m *model) handleAccountImport(path string) {
 		return
 	}
 	parts := []string{fmt.Sprintf("Imported %d account(s)", result.Created)}
+	if result.Notes > 0 {
+		parts = append(parts, fmt.Sprintf("added %d note(s)", result.Notes))
+	}
 	if result.Skipped > 0 {
 		parts = append(parts, fmt.Sprintf("skipped %d", result.Skipped))
 	}
@@ -698,6 +818,8 @@ func (m *model) handleAccountImport(path string) {
 	} else {
 		m.errMessage = ""
 	}
+	m.refreshAccounts()
+	m.refreshDashboard(time.Now().In(m.cfg.Location()))
 }
 
 func expandPath(p string) (string, error) {
@@ -717,6 +839,187 @@ func expandPath(p string) (string, error) {
 		}
 	}
 	return filepath.Abs(trimmed)
+}
+
+func (m *model) openDebugMenu() tea.Cmd {
+	m.infoMessage = ""
+	m.errMessage = ""
+	m.debug.err = ""
+	m.debug.mode = debugViewing
+	m.debug.input.SetValue("")
+	m.debug.startInput.SetValue("")
+	m.debug.endInput.SetValue("")
+	m.debug.rangeStart = time.Time{}
+	m.debug.rangeEnd = time.Time{}
+	if m.state != stateDebug {
+		m.pushState(stateDebug)
+	}
+	return m.setMenuInput("1=1d  2=1w  3=1m  4=1y  5=Oldest500  6=Date range  7=Back", 72)
+}
+
+func (m *model) updateDebug(msg tea.Msg) tea.Cmd {
+	var cmds []tea.Cmd
+	switch m.debug.mode {
+	case debugViewing:
+		if focus := m.ensureMenuInput("1=1d  2=1w  3=1m  4=1y  5=Oldest500  6=Date range  7=Back", 72); focus != nil {
+			cmds = append(cmds, focus)
+		}
+		var cmd tea.Cmd
+		m.menuInput, cmd = m.menuInput.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if key, ok := msg.(tea.KeyMsg); ok {
+			switch key.Type {
+			case tea.KeyEnter:
+				value := strings.TrimSpace(strings.ToLower(m.menuInput.Value()))
+				m.menuInput.SetValue("")
+				switch value {
+				case "1", "1d", "day":
+					m.runCleanupBefore(24*time.Hour, "older than 1 day")
+				case "2", "1w", "week":
+					m.runCleanupBefore(7*24*time.Hour, "older than 1 week")
+				case "3", "1m", "month":
+					m.runCleanupBefore(30*24*time.Hour, "older than 1 month")
+				case "4", "1y", "year":
+					m.runCleanupBefore(365*24*time.Hour, "older than 1 year")
+				case "5", "500", "oldest", "oldest500":
+					m.runCleanupOldest(500)
+				case "6", "range":
+					m.debug.mode = debugRangeStart
+					m.debug.startInput.SetValue("")
+					if focus := m.debug.startInput.Focus(); focus != nil {
+						cmds = append(cmds, focus)
+					}
+				case "7", "back", "exit", "/":
+					m.popState()
+					if m.state == stateMainMenu {
+						if focus := m.setMenuInput("Choose an option", 32); focus != nil {
+							cmds = append(cmds, focus)
+						}
+					}
+					return batchCmds(cmds)
+				default:
+					m.debug.err = "Unknown option"
+				}
+			case tea.KeyEsc:
+				m.popState()
+				if m.state == stateMainMenu {
+					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
+						cmds = append(cmds, focus)
+					}
+				}
+				return batchCmds(cmds)
+			}
+		}
+	case debugRangeStart:
+		if !m.debug.startInput.Focused() {
+			if focus := m.debug.startInput.Focus(); focus != nil {
+				cmds = append(cmds, focus)
+			}
+		}
+		var cmd tea.Cmd
+		m.debug.startInput, cmd = m.debug.startInput.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if key, ok := msg.(tea.KeyMsg); ok {
+			switch key.Type {
+			case tea.KeyEnter:
+				text := strings.TrimSpace(m.debug.startInput.Value())
+				if text == "" {
+					m.debug.rangeStart = time.Time{}
+					m.debug.mode = debugRangeEnd
+					m.debug.endInput.SetValue("")
+					if focus := m.debug.endInput.Focus(); focus != nil {
+						cmds = append(cmds, focus)
+					}
+					return batchCmds(cmds)
+				}
+				parsed, err := parseDateInput(text, m.cfg.Location())
+				if err != nil {
+					m.debug.err = fmt.Sprintf("start date: %v", err)
+				} else {
+					m.debug.rangeStart = parsed
+					m.debug.mode = debugRangeEnd
+					m.debug.endInput.SetValue("")
+					if focus := m.debug.endInput.Focus(); focus != nil {
+						cmds = append(cmds, focus)
+					}
+				}
+			case tea.KeyEsc:
+				m.debug.mode = debugViewing
+				m.debug.startInput.SetValue("")
+			}
+		}
+	case debugRangeEnd:
+		if !m.debug.endInput.Focused() {
+			if focus := m.debug.endInput.Focus(); focus != nil {
+				cmds = append(cmds, focus)
+			}
+		}
+		var cmd tea.Cmd
+		m.debug.endInput, cmd = m.debug.endInput.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if key, ok := msg.(tea.KeyMsg); ok {
+			switch key.Type {
+			case tea.KeyEnter:
+				text := strings.TrimSpace(m.debug.endInput.Value())
+				if text == "" {
+					m.debug.rangeEnd = time.Time{}
+					m.runCleanupRange()
+					return batchCmds(cmds)
+				}
+				parsed, err := parseDateInput(text, m.cfg.Location())
+				if err != nil {
+					m.debug.err = fmt.Sprintf("end date: %v", err)
+				} else {
+					m.debug.rangeEnd = parsed
+					m.runCleanupRange()
+				}
+			case tea.KeyEsc:
+				m.debug.mode = debugViewing
+				m.debug.endInput.SetValue("")
+			}
+		}
+	}
+	return batchCmds(cmds)
+}
+
+func (m *model) viewDebug() string {
+	lines := []string{m.theme.Title.Render("Debug Tools")}
+	lines = append(lines, m.theme.Faint.Render("Ctrl+D to open. Choose a cleanup option."))
+	lines = append(lines, "")
+	switch m.debug.mode {
+	case debugViewing:
+		lines = append(lines, m.theme.Secondary.Render("1. Clear data older than 1 day"))
+		lines = append(lines, m.theme.Secondary.Render("2. Clear data older than 1 week"))
+		lines = append(lines, m.theme.Secondary.Render("3. Clear data older than 1 month"))
+		lines = append(lines, m.theme.Secondary.Render("4. Clear data older than 1 year"))
+		lines = append(lines, m.theme.Secondary.Render("5. Remove oldest 500 records"))
+		lines = append(lines, m.theme.Secondary.Render("6. Clear by date range"))
+		lines = append(lines, m.theme.Faint.Render("7. Back"))
+		lines = append(lines, "")
+		lines = append(lines, m.theme.Accent.Render("> ")+m.menuInput.View())
+	case debugRangeStart:
+		lines = append(lines, m.theme.Secondary.Render("Enter start date (YYYY-MM-DD) or leave blank:"))
+		lines = append(lines, m.debug.startInput.View())
+	case debugRangeEnd:
+		lines = append(lines, m.theme.Secondary.Render("Enter end date (YYYY-MM-DD) or leave blank:"))
+		lines = append(lines, m.debug.endInput.View())
+	}
+	if m.debug.err != "" {
+		lines = append(lines, "", m.theme.Danger.Render(m.debug.err))
+	}
+	if m.infoMessage != "" {
+		lines = append(lines, "", m.theme.Success.Render(m.infoMessage))
+	}
+	if m.errMessage != "" {
+		lines = append(lines, "", m.theme.Danger.Render(m.errMessage))
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func batchCmds(cmds []tea.Cmd) tea.Cmd {
@@ -918,11 +1221,34 @@ func (m *model) updateAccounts(msg tea.Msg) tea.Cmd {
 				return batchCmds(cmds)
 			}
 			trimmedValue := strings.TrimSpace(value)
-			if strings.HasPrefix(strings.ToLower(trimmedValue), "import ") {
+			lowerValue := strings.ToLower(trimmedValue)
+			if strings.HasPrefix(lowerValue, "import ") {
 				path := strings.TrimSpace(trimmedValue[len("import "):])
 				m.handleAccountImport(path)
 				m.accountFilter.SetValue("")
 				m.refreshAccounts()
+				return batchCmds(cmds)
+			}
+			if base, index, ok := extractTrailingNumber(trimmedValue); ok {
+				list := m.accounts
+				if base != "" {
+					accounts, err := m.store.SearchAccounts(context.Background(), base)
+					if err != nil {
+						m.errMessage = fmt.Sprintf("search accounts: %v", err)
+						return batchCmds(cmds)
+					}
+					list = accounts
+				}
+				if index > 0 && index <= len(list) {
+					selected := list[index-1]
+					m.filteredAccounts = list
+					m.accountFilter.SetValue(base)
+					if focus := m.openAccountDetail(selected); focus != nil {
+						cmds = append(cmds, focus)
+					}
+					return batchCmds(cmds)
+				}
+				m.errMessage = "Invalid selection"
 				return batchCmds(cmds)
 			}
 			if account, ok := m.resolveAccountSelection(trimmedValue); ok {
@@ -1357,7 +1683,6 @@ func (m *model) viewCreateChoice() string {
 	if m.errMessage != "" {
 		lines = append(lines, "", m.theme.Danger.Render(m.errMessage))
 	}
-	lines = append(lines, "", m.theme.Accent.Render("cmd> ")+m.menuInput.View())
 	return strings.Join(lines, "\n") + "\n"
 }
 
@@ -1978,7 +2303,8 @@ func (m *model) updateSettings(msg tea.Msg) tea.Cmd {
 	var cmds []tea.Cmd
 	switch m.settings.mode {
 	case settingsViewing:
-		if focus := m.ensureMenuInput("1=Name  2=Timezone  3=Back", 40); focus != nil {
+		m.settings.err = ""
+		if focus := m.ensureMenuInput("1=Name  2=Timezone  3=Import CSV  4=Back", 56); focus != nil {
 			cmds = append(cmds, focus)
 		}
 		var cmd tea.Cmd
@@ -2008,7 +2334,16 @@ func (m *model) updateSettings(msg tea.Msg) tea.Cmd {
 				if focus := m.settings.input.Focus(); focus != nil {
 					cmds = append(cmds, focus)
 				}
-			case "3", "back", "/":
+			case "3", "import", "csv":
+				m.settings.mode = settingsImportPath
+				m.settings.input = textinput.New()
+				m.settings.input.Prompt = ""
+				m.settings.input.CharLimit = 256
+				m.settings.input.Placeholder = "Path to CSV"
+				if focus := m.settings.input.Focus(); focus != nil {
+					cmds = append(cmds, focus)
+				}
+			case "4", "back", "/":
 				m.popState()
 				if m.state == stateMainMenu {
 					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -2022,7 +2357,7 @@ func (m *model) updateSettings(msg tea.Msg) tea.Cmd {
 					cmds = append(cmds, focus)
 				}
 			default:
-				m.settings.err = "Choose 1 or 2 to edit settings"
+				m.settings.err = "Choose 1-3 to edit settings"
 			}
 		}
 	case settingsEditingName:
@@ -2099,6 +2434,34 @@ func (m *model) updateSettings(msg tea.Msg) tea.Cmd {
 				}
 			}
 		}
+	case settingsImportPath:
+		if !m.settings.input.Focused() {
+			if focus := m.settings.input.Focus(); focus != nil {
+				cmds = append(cmds, focus)
+			}
+		}
+		var cmd tea.Cmd
+		m.settings.input, cmd = m.settings.input.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if key, ok := msg.(tea.KeyMsg); ok && key.Type == tea.KeyEnter {
+			value := strings.TrimSpace(m.settings.input.Value())
+			switch {
+			case isExitCommand(value):
+				m.prevStates = nil
+				m.state = stateMainMenu
+				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
+					cmds = append(cmds, focus)
+				}
+			case isBackCommand(value):
+				m.settings.mode = settingsViewing
+			default:
+				m.handleAccountImport(value)
+				m.settings.mode = settingsViewing
+				m.settings.err = ""
+			}
+		}
 	}
 	return batchCmds(cmds)
 }
@@ -2114,9 +2477,10 @@ func (m *model) viewSettings() string {
 	lines = append(lines, m.theme.HelpKey.Render("/")+" → "+m.theme.HelpValue.Render("Back"))
 	lines = append(lines, m.theme.HelpKey.Render("exit.")+" → "+m.theme.HelpValue.Render("Main menu"))
 	lines = append(lines, m.theme.HelpKey.Render("Ctrl+C")+" → "+m.theme.HelpValue.Render("Quit"))
+	lines = append(lines, m.theme.HelpKey.Render("Ctrl+D")+" → "+m.theme.HelpValue.Render("Debug"))
 	lines = append(lines, "")
 	lines = append(lines, m.theme.Highlight.Render("Repo"))
-	lines = append(lines, m.theme.Primary.Render("github.com/yourname/crm-term"))
+	lines = append(lines, m.theme.Primary.Render("github.com/Azteriisk/CRM-Term"))
 	lines = append(lines, m.theme.Faint.Render("Update server configuration coming soon."))
 	lines = append(lines, "")
 
@@ -2124,7 +2488,8 @@ func (m *model) viewSettings() string {
 	case settingsViewing:
 		lines = append(lines, m.theme.Secondary.Render("1. Update name"))
 		lines = append(lines, m.theme.Secondary.Render("2. Update timezone"))
-		lines = append(lines, m.theme.Faint.Render("3. Back"))
+		lines = append(lines, m.theme.Secondary.Render("3. Import accounts from CSV"))
+		lines = append(lines, m.theme.Faint.Render("4. Back"))
 		lines = append(lines, "")
 		lines = append(lines, m.theme.Accent.Render("> ")+m.menuInput.View())
 	case settingsEditingName:
@@ -2132,6 +2497,9 @@ func (m *model) viewSettings() string {
 		lines = append(lines, m.settings.input.View())
 	case settingsEditingTimezone:
 		lines = append(lines, m.theme.Secondary.Render("Enter timezone (e.g. America/New_York):"))
+		lines = append(lines, m.settings.input.View())
+	case settingsImportPath:
+		lines = append(lines, m.theme.Secondary.Render("Enter CSV path:"))
 		lines = append(lines, m.settings.input.View())
 	}
 	if m.settings.err != "" {
