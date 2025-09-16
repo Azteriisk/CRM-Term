@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,6 +51,7 @@ const (
 	stateMainMenu viewState = iota
 	stateDashboard
 	stateAccounts
+	stateAccountDetail
 	stateCreateAccount
 	stateCreateChoice
 	stateCreateNote
@@ -82,6 +86,13 @@ const (
 	eventStageAssociateChoose
 )
 
+type accountDetailView int
+
+const (
+	accountDetailSummary accountDetailView = iota
+	accountDetailActivity
+)
+
 type model struct {
 	state       viewState
 	prevStates  []viewState
@@ -92,6 +103,7 @@ type model struct {
 	height      int
 	infoMessage string
 	errMessage  string
+	showSplash  bool
 
 	menuInput textinput.Model
 
@@ -107,13 +119,17 @@ type model struct {
 	dashboard dashboardModel
 
 	settings settingsModel
+
+	accountDetail accountDetailModel
 }
 
 type accountForm struct {
-	index  int
-	fields []formField
-	input  textinput.Model
-	err    string
+	index    int
+	fields   []formField
+	input    textinput.Model
+	err      string
+	editing  bool
+	original storage.Account
 }
 
 type formField struct {
@@ -129,6 +145,7 @@ type noteWizard struct {
 	accountInput   textinput.Model
 	associate      bool
 	err            string
+	presetAccount  *storage.Account
 }
 
 type eventWizard struct {
@@ -140,6 +157,7 @@ type eventWizard struct {
 	accountInput   textinput.Model
 	associate      bool
 	err            string
+	presetAccount  *storage.Account
 }
 
 type dashboardModel struct {
@@ -152,6 +170,13 @@ type settingsModel struct {
 	mode  settingsMode
 	input textinput.Model
 	err   string
+}
+
+type accountDetailModel struct {
+	account  storage.Account
+	activity []storage.Activity
+	view     accountDetailView
+	err      string
 }
 
 type menuOption struct {
@@ -167,6 +192,14 @@ const (
 	menuCreate     = "create"
 	menuSettings   = "settings"
 	menuQuit       = "quit"
+)
+
+const (
+	accountActionActivity = "activity"
+	accountActionAddNote  = "add-note"
+	accountActionAddEvent = "add-event"
+	accountActionEdit     = "edit-account"
+	accountActionBack     = "back"
 )
 
 var mainMenuOptions = []menuOption{
@@ -202,6 +235,41 @@ var mainMenuOptions = []menuOption{
 	},
 }
 
+var accountDetailOptions = []menuOption{
+	{
+		id:       accountActionActivity,
+		keywords: []string{"activity", "timeline"},
+		synonyms: []string{"1", "activity", "view", "timeline"},
+	},
+	{
+		id:       accountActionAddNote,
+		keywords: []string{"note"},
+		synonyms: []string{"2", "note", "add note", "create note"},
+	},
+	{
+		id:       accountActionAddEvent,
+		keywords: []string{"event"},
+		synonyms: []string{"3", "event", "add event", "create event"},
+	},
+	{
+		id:       accountActionEdit,
+		keywords: []string{"edit", "update"},
+		synonyms: []string{"4", "edit", "update"},
+	},
+	{
+		id:       accountActionBack,
+		keywords: []string{"back", "close"},
+		synonyms: []string{"5", "back", "exit", "exit.", "/"},
+	},
+}
+
+const splashBanner = `   __________  __  ___    ______                  
+  / ____/ __ \/  |/  /   /_  __/__  _________ ___ 
+ / /   / /_/ / /|_/ /_____/ / / _ \/ ___/ __ '__ \
+/ /___/ _, _/ /  / /_____/ / /  __/ /  / / / / / /
+\____/_/ |_/_/  /_/     /_/  \___/_/  /_/ /_/ /_/ 
+`
+
 func newModel(store *storage.Store, cfg *config.Store) *model {
 	ti := textinput.New()
 	ti.Prompt = ""
@@ -225,37 +293,51 @@ func newModel(store *storage.Store, cfg *config.Store) *model {
 		accountFilter: filter,
 		dashboard:     dashboardModel{view: dashboardEvents},
 		settings:      settingsModel{mode: settingsViewing, input: textinput.New()},
+		showSplash:    true,
 	}
 	m.settings.input.Prompt = ""
 	m.settings.input.CharLimit = 64
 
-	m.accountForm = newAccountForm()
-	m.noteWizard = newNoteWizard()
-	m.eventWizard = newEventWizard()
+	m.accountForm = newAccountForm(nil)
+	m.noteWizard = newNoteWizard(nil)
+	m.eventWizard = newEventWizard(nil)
 	m.refreshDashboard(now)
 	m.refreshAccounts()
 	return &m
 }
 
-func newAccountForm() accountForm {
+func newAccountForm(existing *storage.Account) accountForm {
 	ti := textinput.New()
 	ti.Placeholder = "Account name"
 	ti.CharLimit = 96
 	ti.Focus()
-	return accountForm{
-		index: 0,
-		fields: []formField{
-			{label: "Account name", required: true},
-			{label: "Phone", required: false},
-			{label: "Address", required: false},
-			{label: "Email", required: false},
-			{label: "Decision maker", required: false},
-		},
-		input: ti,
+	fields := []formField{
+		{label: "Account name", required: true},
+		{label: "Phone", required: false},
+		{label: "Address", required: false},
+		{label: "Email", required: false},
+		{label: "Decision maker", required: false},
 	}
+	form := accountForm{
+		index:  0,
+		fields: fields,
+		input:  ti,
+	}
+	if existing != nil {
+		clone := *existing
+		form.editing = true
+		form.original = clone
+		form.fields[0].value = existing.Name
+		form.fields[1].value = existing.Phone
+		form.fields[2].value = existing.Address
+		form.fields[3].value = existing.Email
+		form.fields[4].value = existing.DecisionMaker
+		form.input.SetValue(existing.Name)
+	}
+	return form
 }
 
-func newNoteWizard() noteWizard {
+func newNoteWizard(account *storage.Account) noteWizard {
 	content := textinput.New()
 	content.Placeholder = "Note details"
 	content.CharLimit = 256
@@ -265,19 +347,24 @@ func newNoteWizard() noteWizard {
 	assoc.Placeholder = "Associate with account? (y/n)"
 	assoc.CharLimit = 5
 
-	account := textinput.New()
-	account.Placeholder = "Type account name"
-	account.CharLimit = 96
+	accountInput := textinput.New()
+	accountInput.Placeholder = "Type account name"
+	accountInput.CharLimit = 96
 
-	return noteWizard{
+	wizard := noteWizard{
 		stage:          noteStageContent,
 		contentInput:   content,
 		associateInput: assoc,
-		accountInput:   account,
+		accountInput:   accountInput,
 	}
+	if account != nil {
+		clone := *account
+		wizard.presetAccount = &clone
+	}
+	return wizard
 }
 
-func newEventWizard() eventWizard {
+func newEventWizard(account *storage.Account) eventWizard {
 	title := textinput.New()
 	title.Placeholder = "Event title"
 	title.CharLimit = 96
@@ -295,18 +382,23 @@ func newEventWizard() eventWizard {
 	assoc.Placeholder = "Associate with account? (y/n)"
 	assoc.CharLimit = 5
 
-	account := textinput.New()
-	account.Placeholder = "Type account name"
-	account.CharLimit = 96
+	accountInput := textinput.New()
+	accountInput.Placeholder = "Type account name"
+	accountInput.CharLimit = 96
 
-	return eventWizard{
+	wizard := eventWizard{
 		stage:          eventStageTitle,
 		titleInput:     title,
 		detailsInput:   details,
 		scheduleInput:  schedule,
 		associateInput: assoc,
-		accountInput:   account,
+		accountInput:   accountInput,
 	}
+	if account != nil {
+		clone := *account
+		wizard.presetAccount = &clone
+	}
+	return wizard
 }
 
 func (m *model) Init() tea.Cmd {
@@ -330,6 +422,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = m.updateMainMenu(msg)
 	case stateAccounts:
 		cmd = m.updateAccounts(msg)
+	case stateAccountDetail:
+		cmd = m.updateAccountDetail(msg)
 	case stateCreateAccount:
 		cmd = m.updateAccountForm(msg)
 	case stateCreateChoice:
@@ -355,6 +449,8 @@ func (m *model) View() string {
 		return m.viewMainMenu()
 	case stateAccounts:
 		return m.viewAccounts()
+	case stateAccountDetail:
+		return m.viewAccountDetail()
 	case stateCreateAccount:
 		return m.viewAccountForm()
 	case stateCreateChoice:
@@ -448,6 +544,181 @@ func resolveMainMenuSelection(input string) (string, bool) {
 	return "", false
 }
 
+func (m *model) resolveAccountSelection(input string) (storage.Account, bool) {
+	var empty storage.Account
+	if len(m.accounts) == 0 && len(m.filteredAccounts) == 0 {
+		return empty, false
+	}
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		if len(m.filteredAccounts) == 1 {
+			return m.filteredAccounts[0], true
+		}
+		return empty, false
+	}
+	lower := strings.ToLower(trimmed)
+	query := trimmed
+	switch {
+	case strings.HasPrefix(lower, "open "):
+		query = strings.TrimSpace(trimmed[5:])
+	case strings.HasPrefix(lower, "view "):
+		query = strings.TrimSpace(trimmed[5:])
+	case strings.HasPrefix(lower, "select "):
+		query = strings.TrimSpace(trimmed[7:])
+	case strings.HasPrefix(lower, "#"):
+		query = strings.TrimSpace(trimmed[1:])
+	}
+	if idx, err := strconv.Atoi(query); err == nil {
+		if idx > 0 && idx <= len(m.filteredAccounts) {
+			return m.filteredAccounts[idx-1], true
+		}
+	}
+	for _, list := range [][]storage.Account{m.filteredAccounts, m.accounts} {
+		for i := range list {
+			if strings.EqualFold(list[i].Name, query) {
+				return list[i], true
+			}
+		}
+	}
+	queryLower := strings.ToLower(query)
+	var match storage.Account
+	count := 0
+	for _, list := range [][]storage.Account{m.filteredAccounts, m.accounts} {
+		for i := range list {
+			if strings.HasPrefix(strings.ToLower(list[i].Name), queryLower) {
+				match = list[i]
+				count++
+			}
+		}
+		if count == 1 {
+			return match, true
+		}
+	}
+	return empty, false
+}
+
+func resolveAccountDetailAction(input string) (string, bool) {
+	value := strings.TrimSpace(strings.ToLower(input))
+	if value == "" {
+		return "", false
+	}
+	for _, option := range accountDetailOptions {
+		for _, syn := range option.synonyms {
+			if value == syn {
+				return option.id, true
+			}
+		}
+	}
+	matches := make(map[string]struct{})
+	for _, option := range accountDetailOptions {
+		for _, keyword := range option.keywords {
+			if strings.HasPrefix(keyword, value) {
+				matches[option.id] = struct{}{}
+				break
+			}
+		}
+	}
+	if len(matches) == 1 {
+		for id := range matches {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+func (m *model) openAccountDetail(account storage.Account) tea.Cmd {
+	m.accountDetail.account = account
+	m.accountDetail.view = accountDetailSummary
+	m.accountDetail.activity = nil
+	m.accountDetail.err = ""
+	m.refreshAccountDetailAccount()
+	m.pushState(stateAccountDetail)
+	return m.setMenuInput("1=Activity  2=Add note  3=Add event  4=Edit  5=Back", 64)
+}
+
+func (m *model) refreshAccountDetailAccount() {
+	if m.accountDetail.account.ID == 0 {
+		return
+	}
+	ctx := context.Background()
+	account, err := m.store.AccountByID(ctx, m.accountDetail.account.ID)
+	if err != nil {
+		m.accountDetail.err = fmt.Sprintf("load account: %v", err)
+		return
+	}
+	m.accountDetail.account = *account
+}
+
+func (m *model) loadAccountActivity() {
+	if m.accountDetail.account.ID == 0 {
+		m.accountDetail.activity = nil
+		return
+	}
+	ctx := context.Background()
+	activity, err := m.store.ListAccountActivity(ctx, m.accountDetail.account.ID, 50)
+	if err != nil {
+		m.accountDetail.err = fmt.Sprintf("load activity: %v", err)
+		return
+	}
+	m.accountDetail.err = ""
+	m.accountDetail.activity = activity
+}
+
+func (m *model) handleAccountImport(path string) {
+	m.infoMessage = ""
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		m.errMessage = "Provide a CSV path"
+		return
+	}
+	resolved, err := expandPath(trimmed)
+	if err != nil {
+		m.errMessage = fmt.Sprintf("import path: %v", err)
+		return
+	}
+	file, err := os.Open(resolved)
+	if err != nil {
+		m.errMessage = fmt.Sprintf("open file: %v", err)
+		return
+	}
+	defer file.Close()
+	ctx := context.Background()
+	result, err := m.store.ImportAccountsCSV(ctx, file, m.cfg.Config.Name, m.cfg.Location())
+	if err != nil {
+		m.errMessage = fmt.Sprintf("import csv: %v", err)
+		return
+	}
+	parts := []string{fmt.Sprintf("Imported %d account(s)", result.Created)}
+	if result.Skipped > 0 {
+		parts = append(parts, fmt.Sprintf("skipped %d", result.Skipped))
+	}
+	m.infoMessage = strings.Join(parts, ", ")
+	if len(result.Errors) > 0 {
+		m.errMessage = strings.Join(result.Errors, "; ")
+	} else {
+		m.errMessage = ""
+	}
+}
+
+func expandPath(p string) (string, error) {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	if strings.HasPrefix(trimmed, "~") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			switch {
+			case len(trimmed) == 1:
+				trimmed = home
+			case trimmed[1] == '/', trimmed[1] == '\\':
+				trimmed = filepath.Join(home, trimmed[2:])
+			}
+		}
+	}
+	return filepath.Abs(trimmed)
+}
+
 func batchCmds(cmds []tea.Cmd) tea.Cmd {
 	filtered := cmds[:0]
 	for _, c := range cmds {
@@ -529,6 +800,7 @@ func (m *model) updateMainMenu(msg tea.Msg) tea.Cmd {
 	if key, ok := msg.(tea.KeyMsg); ok && key.Type == tea.KeyEnter {
 		choice := strings.TrimSpace(strings.ToLower(m.menuInput.Value()))
 		m.menuInput.SetValue("")
+		m.showSplash = false
 		action, ok := resolveMainMenuSelection(choice)
 		if !ok {
 			if choice == "" || choice == "0" {
@@ -556,7 +828,7 @@ func (m *model) updateMainMenu(msg tea.Msg) tea.Cmd {
 			m.refreshAccounts()
 		case menuAddAccount:
 			m.resetMessages()
-			m.accountForm = newAccountForm()
+			m.accountForm = newAccountForm(nil)
 			m.pushState(stateCreateAccount)
 		case menuCreate:
 			m.resetMessages()
@@ -583,6 +855,10 @@ func (m *model) updateMainMenu(msg tea.Msg) tea.Cmd {
 
 func (m *model) viewMainMenu() string {
 	lines := []string{}
+	if m.showSplash {
+		lines = append(lines, splashBanner)
+		lines = append(lines, "")
+	}
 	lines = append(lines, m.theme.Title.Render("CRM-Term"))
 	lines = append(lines, m.theme.Secondary.Render("A lightning-fast terminal CRM"))
 	if m.infoMessage != "" {
@@ -621,7 +897,7 @@ func (m *model) updateAccounts(msg tea.Msg) tea.Cmd {
 	case tea.KeyMsg:
 		switch key.Type {
 		case tea.KeyEnter:
-			value := m.accountFilter.Value()
+			value := strings.TrimSpace(m.accountFilter.Value())
 			if isExitCommand(value) {
 				m.accountFilter.SetValue("")
 				m.prevStates = nil
@@ -638,6 +914,21 @@ func (m *model) updateAccounts(msg tea.Msg) tea.Cmd {
 					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
 						cmds = append(cmds, focus)
 					}
+				}
+				return batchCmds(cmds)
+			}
+			trimmedValue := strings.TrimSpace(value)
+			if strings.HasPrefix(strings.ToLower(trimmedValue), "import ") {
+				path := strings.TrimSpace(trimmedValue[len("import "):])
+				m.handleAccountImport(path)
+				m.accountFilter.SetValue("")
+				m.refreshAccounts()
+				return batchCmds(cmds)
+			}
+			if account, ok := m.resolveAccountSelection(trimmedValue); ok {
+				m.accountFilter.SetValue("")
+				if focus := m.openAccountDetail(account); focus != nil {
+					cmds = append(cmds, focus)
 				}
 				return batchCmds(cmds)
 			}
@@ -667,14 +958,15 @@ func (m *model) updateAccounts(msg tea.Msg) tea.Cmd {
 
 func (m *model) viewAccounts() string {
 	lines := []string{m.theme.Title.Render("Accounts")}
-	lines = append(lines, m.theme.Faint.Render("Type to search. '/' to go back, 'exit.' to go home."))
+	lines = append(lines, m.theme.Faint.Render("Type to search. Enter a number or name to manage, or 'import <path>' to load CSV. '/' to go back, 'exit.' home."))
 	lines = append(lines, "")
 	if len(m.filteredAccounts) == 0 {
 		lines = append(lines, m.theme.Warning.Render("No accounts found."))
 	} else {
-		for _, a := range m.filteredAccounts {
+		for i, a := range m.filteredAccounts {
 			created := a.CreatedAt.In(m.cfg.Location()).Format("Jan 02 2006 15:04")
-			lines = append(lines, m.theme.Primary.Render(a.Name))
+			header := fmt.Sprintf("%d. %s", i+1, a.Name)
+			lines = append(lines, m.theme.Primary.Render(header))
 			meta := []string{}
 			if a.Phone != "" {
 				meta = append(meta, fmt.Sprintf("Phone: %s", a.Phone))
@@ -714,7 +1006,7 @@ func (m *model) updateAccountForm(msg tea.Msg) tea.Cmd {
 		case tea.KeyEnter:
 			value := strings.TrimSpace(m.accountForm.input.Value())
 			if isExitCommand(value) {
-				m.accountForm = newAccountForm()
+				m.accountForm = newAccountForm(nil)
 				m.prevStates = nil
 				m.state = stateMainMenu
 				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -724,20 +1016,28 @@ func (m *model) updateAccountForm(msg tea.Msg) tea.Cmd {
 			}
 			if isBackCommand(value) {
 				if m.accountForm.index == 0 {
-					m.accountForm = newAccountForm()
+					var focus tea.Cmd
+					if m.accountForm.editing {
+						account := m.accountForm.original
+						m.accountForm = newAccountForm(&account)
+					} else {
+						m.accountForm = newAccountForm(nil)
+					}
 					m.popState()
 					if m.state == stateMainMenu {
-						if focus := m.setMenuInput("Choose an option", 32); focus != nil {
-							cmds = append(cmds, focus)
-						}
+						focus = m.setMenuInput("Choose an option", 32)
+					} else if m.state == stateAccountDetail {
+						focus = m.setMenuInput("1=Activity  2=Add note  3=Add event  4=Edit  5=Back", 64)
+					}
+					if focus != nil {
+						cmds = append(cmds, focus)
 					}
 					return batchCmds(cmds)
 				}
-				m.accountForm.fields[m.accountForm.index].value = value
 				m.accountForm.index--
 				prev := m.accountForm.fields[m.accountForm.index]
-				m.accountForm.input.SetValue(prev.value)
 				m.accountForm.input.Placeholder = prev.label
+				m.accountForm.input.SetValue(prev.value)
 				m.accountForm.err = ""
 				return batchCmds(cmds)
 			}
@@ -749,29 +1049,60 @@ func (m *model) updateAccountForm(msg tea.Msg) tea.Cmd {
 			m.accountForm.input.SetValue("")
 			m.accountForm.err = ""
 			if m.accountForm.index >= len(m.accountForm.fields)-1 {
-				account := buildAccount(m.accountForm.fields)
-				account.Creator = m.cfg.Config.Name
-				account.CreatedAt = time.Now().In(m.cfg.Location())
-				if err := m.store.CreateAccount(context.Background(), &account); err != nil {
-					if err == storage.ErrAccountExists {
-						m.accountForm.err = "An account with that name already exists"
-						m.accountForm.index = 0
-						m.accountForm.input.SetValue("")
-						m.accountForm.input.Placeholder = m.accountForm.fields[0].label
+				base := storage.Account{}
+				if m.accountForm.editing {
+					base = m.accountForm.original
+				}
+				account := buildAccount(m.accountForm.fields, base)
+				ctx := context.Background()
+				if m.accountForm.editing {
+					if err := m.store.UpdateAccount(ctx, &account); err != nil {
+						if err == storage.ErrAccountExists {
+							m.accountForm.err = "An account with that name already exists"
+							m.accountForm.index = 0
+							m.accountForm.input.SetValue(account.Name)
+							m.accountForm.input.Placeholder = m.accountForm.fields[0].label
+							return batchCmds(cmds)
+						}
+						m.accountForm.err = err.Error()
 						return batchCmds(cmds)
 					}
-					m.accountForm.err = err.Error()
-					return batchCmds(cmds)
-				}
-				m.infoMessage = fmt.Sprintf("Account '%s' created", account.Name)
-				m.accountForm = newAccountForm()
-				m.popState()
-				if m.state == stateMainMenu {
-					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
-						cmds = append(cmds, focus)
+					m.infoMessage = fmt.Sprintf("Account '%s' updated", account.Name)
+				} else {
+					account.Creator = m.cfg.Config.Name
+					account.CreatedAt = time.Now().In(m.cfg.Location())
+					if err := m.store.CreateAccount(ctx, &account); err != nil {
+						if err == storage.ErrAccountExists {
+							m.accountForm.err = "An account with that name already exists"
+							m.accountForm.index = 0
+							m.accountForm.input.SetValue("")
+							m.accountForm.input.Placeholder = m.accountForm.fields[0].label
+							return batchCmds(cmds)
+						}
+						m.accountForm.err = err.Error()
+						return batchCmds(cmds)
 					}
+					m.infoMessage = fmt.Sprintf("Account '%s' created", account.Name)
+				}
+				if m.accountForm.editing {
+					m.accountDetail.account = account
+					m.refreshAccountDetailAccount()
+				}
+				m.accountForm = newAccountForm(nil)
+				m.popState()
+				var focus tea.Cmd
+				if m.state == stateMainMenu {
+					focus = m.setMenuInput("Choose an option", 32)
+				} else if m.state == stateAccountDetail {
+					focus = m.setMenuInput("1=Activity  2=Add note  3=Add event  4=Edit  5=Back", 64)
+				}
+				if focus != nil {
+					cmds = append(cmds, focus)
 				}
 				m.refreshAccounts()
+				if m.state == stateAccountDetail {
+					m.loadAccountActivity()
+				}
 				return batchCmds(cmds)
 			}
 			m.accountForm.index++
@@ -779,12 +1110,21 @@ func (m *model) updateAccountForm(msg tea.Msg) tea.Cmd {
 			m.accountForm.input.Placeholder = next.label
 			m.accountForm.input.SetValue(next.value)
 		case tea.KeyEsc:
-			m.accountForm = newAccountForm()
+			var focus tea.Cmd
+			if m.accountForm.editing {
+				account := m.accountForm.original
+				m.accountForm = newAccountForm(&account)
+			} else {
+				m.accountForm = newAccountForm(nil)
+			}
 			m.popState()
 			if m.state == stateMainMenu {
-				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
-					cmds = append(cmds, focus)
-				}
+				focus = m.setMenuInput("Choose an option", 32)
+			} else if m.state == stateAccountDetail {
+				focus = m.setMenuInput("1=Activity  2=Add note  3=Add event  4=Edit  5=Back", 64)
+			}
+			if focus != nil {
+				cmds = append(cmds, focus)
 			}
 			return batchCmds(cmds)
 		}
@@ -792,8 +1132,8 @@ func (m *model) updateAccountForm(msg tea.Msg) tea.Cmd {
 	return batchCmds(cmds)
 }
 
-func buildAccount(fields []formField) storage.Account {
-	var account storage.Account
+func buildAccount(fields []formField, base storage.Account) storage.Account {
+	account := base
 	if len(fields) > 0 {
 		account.Name = fields[0].value
 	}
@@ -814,8 +1154,12 @@ func buildAccount(fields []formField) storage.Account {
 
 func (m *model) viewAccountForm() string {
 	field := m.accountForm.fields[m.accountForm.index]
+	title := "Add Account"
+	if m.accountForm.editing {
+		title = "Edit Account"
+	}
 	lines := []string{
-		m.theme.Title.Render("Add Account"),
+		m.theme.Title.Render(title),
 		m.theme.Faint.Render("Enter details. '/' to go back, 'exit.' to cancel."),
 		"",
 		m.theme.Secondary.Render(fmt.Sprintf("%d/%d", m.accountForm.index+1, len(m.accountForm.fields))),
@@ -824,6 +1168,137 @@ func (m *model) viewAccountForm() string {
 	}
 	if m.accountForm.err != "" {
 		lines = append(lines, "", m.theme.Danger.Render(m.accountForm.err))
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func (m *model) updateAccountDetail(msg tea.Msg) tea.Cmd {
+	var cmds []tea.Cmd
+	if focus := m.ensureMenuInput("1=Activity  2=Add note  3=Add event  4=Edit  5=Back", 64); focus != nil {
+		cmds = append(cmds, focus)
+	}
+	var cmd tea.Cmd
+	m.menuInput, cmd = m.menuInput.Update(msg)
+	if cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+
+	switch key := msg.(type) {
+	case tea.KeyMsg:
+		switch key.Type {
+		case tea.KeyEnter:
+			choice := strings.TrimSpace(strings.ToLower(m.menuInput.Value()))
+			m.menuInput.SetValue("")
+			action, ok := resolveAccountDetailAction(choice)
+			if !ok {
+				if choice == "" {
+					return batchCmds(cmds)
+				}
+				m.accountDetail.err = "Unknown choice"
+				return batchCmds(cmds)
+			}
+			m.accountDetail.err = ""
+			switch action {
+			case accountActionActivity:
+				m.accountDetail.view = accountDetailActivity
+				m.loadAccountActivity()
+			case accountActionAddNote:
+				m.accountDetail.view = accountDetailSummary
+				account := m.accountDetail.account
+				m.noteWizard = newNoteWizard(&account)
+				m.pushState(stateCreateNote)
+				return batchCmds(cmds)
+			case accountActionAddEvent:
+				m.accountDetail.view = accountDetailSummary
+				account := m.accountDetail.account
+				m.eventWizard = newEventWizard(&account)
+				m.pushState(stateCreateEvent)
+				return batchCmds(cmds)
+			case accountActionEdit:
+				m.accountDetail.view = accountDetailSummary
+				account := m.accountDetail.account
+				m.accountForm = newAccountForm(&account)
+				m.pushState(stateCreateAccount)
+				return batchCmds(cmds)
+			case accountActionBack:
+				m.popState()
+				if m.state == stateMainMenu {
+					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
+						cmds = append(cmds, focus)
+					}
+				}
+				return batchCmds(cmds)
+			}
+		case tea.KeyEsc:
+			m.popState()
+			if m.state == stateMainMenu {
+				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
+					cmds = append(cmds, focus)
+				}
+			}
+			return batchCmds(cmds)
+		}
+	}
+	return batchCmds(cmds)
+}
+
+func (m *model) viewAccountDetail() string {
+	a := m.accountDetail.account
+	lines := []string{m.theme.Title.Render(a.Name)}
+	meta := []string{}
+	if a.Phone != "" {
+		meta = append(meta, fmt.Sprintf("Phone: %s", a.Phone))
+	}
+	if a.Email != "" {
+		meta = append(meta, fmt.Sprintf("Email: %s", a.Email))
+	}
+	if a.DecisionMaker != "" {
+		meta = append(meta, fmt.Sprintf("Decision Maker: %s", a.DecisionMaker))
+	}
+	if len(meta) > 0 {
+		lines = append(lines, m.theme.Secondary.Render(strings.Join(meta, "  •  ")))
+	}
+	if a.Address != "" {
+		lines = append(lines, m.theme.Faint.Render(a.Address))
+	}
+	created := a.CreatedAt.In(m.cfg.Location()).Format("Jan 02 2006 15:04")
+	lines = append(lines, m.theme.Faint.Render(fmt.Sprintf("Created by %s on %s", a.Creator, created)))
+	lines = append(lines, "")
+
+	if m.accountDetail.view == accountDetailActivity {
+		lines = append(lines, m.theme.Subtitle.Render("Recent Activity"))
+		if len(m.accountDetail.activity) == 0 {
+			lines = append(lines, m.theme.Faint.Render("No activity yet."))
+		} else {
+			for _, act := range m.accountDetail.activity {
+				stamp := act.CreatedAt.In(m.cfg.Location()).Format("Jan 02 15:04")
+				typeLabel := act.Type
+				if len(typeLabel) > 0 {
+					typeLabel = strings.ToUpper(typeLabel[:1]) + typeLabel[1:]
+				}
+				item := fmt.Sprintf("[%s] %s — %s", typeLabel, act.Title, stamp)
+				lines = append(lines, m.theme.Primary.Render(item))
+			}
+		}
+		lines = append(lines, "")
+	}
+
+	lines = append(lines, m.theme.Subtitle.Render("Actions"))
+	lines = append(lines, m.theme.Secondary.Render("1. View activity"))
+	lines = append(lines, m.theme.Secondary.Render("2. Add note (auto links)"))
+	lines = append(lines, m.theme.Secondary.Render("3. Add event (auto links)"))
+	lines = append(lines, m.theme.Secondary.Render("4. Edit account"))
+	lines = append(lines, m.theme.Faint.Render("5. Back"))
+	lines = append(lines, "")
+	lines = append(lines, m.theme.Accent.Render("> ")+m.menuInput.View())
+	if m.accountDetail.err != "" {
+		lines = append(lines, "", m.theme.Danger.Render(m.accountDetail.err))
+	}
+	if m.infoMessage != "" {
+		lines = append(lines, "", m.theme.Success.Render(m.infoMessage))
+	}
+	if m.errMessage != "" {
+		lines = append(lines, "", m.theme.Danger.Render(m.errMessage))
 	}
 	return strings.Join(lines, "\n") + "\n"
 }
@@ -845,10 +1320,10 @@ func (m *model) updateCreateChoice(msg tea.Msg) tea.Cmd {
 		m.menuInput.SetValue("")
 		switch input {
 		case "1", "note", "n":
-			m.noteWizard = newNoteWizard()
+			m.noteWizard = newNoteWizard(nil)
 			m.state = stateCreateNote
 		case "2", "event", "e":
-			m.eventWizard = newEventWizard()
+			m.eventWizard = newEventWizard(nil)
 			m.state = stateCreateEvent
 		case "3", "back", "/":
 			m.popState()
@@ -905,7 +1380,7 @@ func (m *model) updateNoteWizard(msg tea.Msg) tea.Cmd {
 			value := strings.TrimSpace(m.noteWizard.contentInput.Value())
 			switch {
 			case isExitCommand(value):
-				m.noteWizard = newNoteWizard()
+				m.noteWizard = newNoteWizard(nil)
 				m.prevStates = nil
 				m.state = stateMainMenu
 				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -913,7 +1388,7 @@ func (m *model) updateNoteWizard(msg tea.Msg) tea.Cmd {
 				}
 				return batchCmds(cmds)
 			case isBackCommand(value):
-				m.noteWizard = newNoteWizard()
+				m.noteWizard = newNoteWizard(nil)
 				m.popState()
 				if m.state == stateMainMenu {
 					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -925,7 +1400,25 @@ func (m *model) updateNoteWizard(msg tea.Msg) tea.Cmd {
 				m.noteWizard.err = "Note cannot be empty"
 			default:
 				m.noteWizard.err = ""
-				m.noteWizard.stage = noteStageAssociatePrompt
+				if m.noteWizard.presetAccount != nil {
+					accountID := sql.NullInt64{Int64: m.noteWizard.presetAccount.ID, Valid: true}
+					if err := m.saveNote(&accountID); err != nil {
+						m.noteWizard.err = err.Error()
+					} else {
+						name := m.noteWizard.presetAccount.Name
+						if name == "" {
+							name = m.accountDetail.account.Name
+						}
+						message := "Note saved"
+						if name != "" {
+							message = fmt.Sprintf("Note saved for %s", name)
+						}
+						m.completeNoteSave(message)
+						return batchCmds(cmds)
+					}
+				} else {
+					m.noteWizard.stage = noteStageAssociatePrompt
+				}
 			}
 		}
 	case noteStageAssociatePrompt:
@@ -944,7 +1437,7 @@ func (m *model) updateNoteWizard(msg tea.Msg) tea.Cmd {
 			m.noteWizard.associateInput.SetValue("")
 			switch {
 			case isExitCommand(value):
-				m.noteWizard = newNoteWizard()
+				m.noteWizard = newNoteWizard(nil)
 				m.prevStates = nil
 				m.state = stateMainMenu
 				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -962,9 +1455,6 @@ func (m *model) updateNoteWizard(msg tea.Msg) tea.Cmd {
 					m.noteWizard.err = err.Error()
 				} else {
 					m.completeNoteSave("Note saved")
-					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
-						cmds = append(cmds, focus)
-					}
 					return batchCmds(cmds)
 				}
 			default:
@@ -986,7 +1476,7 @@ func (m *model) updateNoteWizard(msg tea.Msg) tea.Cmd {
 			value := strings.TrimSpace(m.noteWizard.accountInput.Value())
 			switch {
 			case isExitCommand(value):
-				m.noteWizard = newNoteWizard()
+				m.noteWizard = newNoteWizard(nil)
 				m.prevStates = nil
 				m.state = stateMainMenu
 				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -1000,9 +1490,6 @@ func (m *model) updateNoteWizard(msg tea.Msg) tea.Cmd {
 					m.noteWizard.err = err.Error()
 				} else {
 					m.completeNoteSave("Note saved")
-					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
-						cmds = append(cmds, focus)
-					}
 					return batchCmds(cmds)
 				}
 			default:
@@ -1015,9 +1502,6 @@ func (m *model) updateNoteWizard(msg tea.Msg) tea.Cmd {
 						m.noteWizard.err = err.Error()
 					} else {
 						m.completeNoteSave(fmt.Sprintf("Note saved for %s", account.Name))
-						if focus := m.setMenuInput("Choose an option", 32); focus != nil {
-							cmds = append(cmds, focus)
-						}
 						return batchCmds(cmds)
 					}
 				}
@@ -1032,6 +1516,9 @@ func (m *model) viewNoteWizard() string {
 	switch m.noteWizard.stage {
 	case noteStageContent:
 		lines = append(lines, m.theme.Faint.Render("Type note text and press enter. '/' to cancel."))
+		if m.noteWizard.presetAccount != nil {
+			lines = append(lines, m.theme.Faint.Render(fmt.Sprintf("Will link to %s", m.noteWizard.presetAccount.Name)))
+		}
 		lines = append(lines, "")
 		lines = append(lines, m.noteWizard.contentInput.View())
 	case noteStageAssociatePrompt:
@@ -1062,9 +1549,15 @@ func (m *model) saveNote(accountID *sql.NullInt64) error {
 }
 
 func (m *model) completeNoteSave(message string) {
-	m.noteWizard = newNoteWizard()
+	m.noteWizard = newNoteWizard(nil)
 	m.infoMessage = message
 	m.popState()
+	if m.state == stateAccountDetail {
+		m.refreshAccountDetailAccount()
+		m.loadAccountActivity()
+	} else if m.state == stateMainMenu {
+		m.setMenuInput("Choose an option", 32)
+	}
 	m.refreshDashboard(time.Now().In(m.cfg.Location()))
 }
 
@@ -1087,7 +1580,7 @@ func (m *model) updateEventWizard(msg tea.Msg) tea.Cmd {
 			value := strings.TrimSpace(m.eventWizard.titleInput.Value())
 			switch {
 			case isExitCommand(value):
-				m.eventWizard = newEventWizard()
+				m.eventWizard = newEventWizard(nil)
 				m.prevStates = nil
 				m.state = stateMainMenu
 				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -1095,7 +1588,7 @@ func (m *model) updateEventWizard(msg tea.Msg) tea.Cmd {
 				}
 				return batchCmds(cmds)
 			case isBackCommand(value):
-				m.eventWizard = newEventWizard()
+				m.eventWizard = newEventWizard(nil)
 				m.popState()
 				if m.state == stateMainMenu {
 					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -1124,7 +1617,7 @@ func (m *model) updateEventWizard(msg tea.Msg) tea.Cmd {
 		if key, ok := msg.(tea.KeyMsg); ok && key.Type == tea.KeyEnter {
 			value := strings.TrimSpace(m.eventWizard.detailsInput.Value())
 			if isExitCommand(value) {
-				m.eventWizard = newEventWizard()
+				m.eventWizard = newEventWizard(nil)
 				m.prevStates = nil
 				m.state = stateMainMenu
 				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -1152,7 +1645,7 @@ func (m *model) updateEventWizard(msg tea.Msg) tea.Cmd {
 		if key, ok := msg.(tea.KeyMsg); ok && key.Type == tea.KeyEnter {
 			value := strings.TrimSpace(m.eventWizard.scheduleInput.Value())
 			if isExitCommand(value) {
-				m.eventWizard = newEventWizard()
+				m.eventWizard = newEventWizard(nil)
 				m.prevStates = nil
 				m.state = stateMainMenu
 				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -1172,7 +1665,25 @@ func (m *model) updateEventWizard(msg tea.Msg) tea.Cmd {
 				}
 			}
 			m.eventWizard.err = ""
-			m.eventWizard.stage = eventStageAssociatePrompt
+			if m.eventWizard.presetAccount != nil {
+				accountID := sql.NullInt64{Int64: m.eventWizard.presetAccount.ID, Valid: true}
+				if err := m.saveEvent(&accountID); err != nil {
+					m.eventWizard.err = err.Error()
+				} else {
+					name := m.eventWizard.presetAccount.Name
+					if name == "" {
+						name = m.accountDetail.account.Name
+					}
+					message := "Event created"
+					if name != "" {
+						message = fmt.Sprintf("Event created for %s", name)
+					}
+					m.completeEventSave(message)
+					return batchCmds(cmds)
+				}
+			} else {
+				m.eventWizard.stage = eventStageAssociatePrompt
+			}
 		}
 	case eventStageAssociatePrompt:
 		if !m.eventWizard.associateInput.Focused() {
@@ -1190,7 +1701,7 @@ func (m *model) updateEventWizard(msg tea.Msg) tea.Cmd {
 			m.eventWizard.associateInput.SetValue("")
 			switch {
 			case isExitCommand(value):
-				m.eventWizard = newEventWizard()
+				m.eventWizard = newEventWizard(nil)
 				m.prevStates = nil
 				m.state = stateMainMenu
 				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -1208,9 +1719,6 @@ func (m *model) updateEventWizard(msg tea.Msg) tea.Cmd {
 					m.eventWizard.err = err.Error()
 				} else {
 					m.completeEventSave("Event created")
-					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
-						cmds = append(cmds, focus)
-					}
 					return batchCmds(cmds)
 				}
 			default:
@@ -1232,7 +1740,7 @@ func (m *model) updateEventWizard(msg tea.Msg) tea.Cmd {
 			value := strings.TrimSpace(m.eventWizard.accountInput.Value())
 			switch {
 			case isExitCommand(value):
-				m.eventWizard = newEventWizard()
+				m.eventWizard = newEventWizard(nil)
 				m.prevStates = nil
 				m.state = stateMainMenu
 				if focus := m.setMenuInput("Choose an option", 32); focus != nil {
@@ -1246,9 +1754,6 @@ func (m *model) updateEventWizard(msg tea.Msg) tea.Cmd {
 					m.eventWizard.err = err.Error()
 				} else {
 					m.completeEventSave("Event created")
-					if focus := m.setMenuInput("Choose an option", 32); focus != nil {
-						cmds = append(cmds, focus)
-					}
 					return batchCmds(cmds)
 				}
 			default:
@@ -1261,9 +1766,6 @@ func (m *model) updateEventWizard(msg tea.Msg) tea.Cmd {
 						m.eventWizard.err = err.Error()
 					} else {
 						m.completeEventSave(fmt.Sprintf("Event created for %s", account.Name))
-						if focus := m.setMenuInput("Choose an option", 32); focus != nil {
-							cmds = append(cmds, focus)
-						}
 						return batchCmds(cmds)
 					}
 				}
@@ -1279,6 +1781,9 @@ func (m *model) viewEventWizard() string {
 	case eventStageTitle:
 		lines = append(lines, m.theme.Secondary.Render("Event title:"))
 		lines = append(lines, m.eventWizard.titleInput.View())
+		if m.eventWizard.presetAccount != nil {
+			lines = append(lines, m.theme.Faint.Render(fmt.Sprintf("Will link to %s", m.eventWizard.presetAccount.Name)))
+		}
 	case eventStageDetails:
 		lines = append(lines, m.theme.Secondary.Render("Details (optional):"))
 		lines = append(lines, m.eventWizard.detailsInput.View())
@@ -1328,9 +1833,15 @@ func (m *model) saveEvent(accountID *sql.NullInt64) error {
 }
 
 func (m *model) completeEventSave(message string) {
-	m.eventWizard = newEventWizard()
+	m.eventWizard = newEventWizard(nil)
 	m.infoMessage = message
 	m.popState()
+	if m.state == stateAccountDetail {
+		m.refreshAccountDetailAccount()
+		m.loadAccountActivity()
+	} else if m.state == stateMainMenu {
+		m.setMenuInput("Choose an option", 32)
+	}
 	m.refreshDashboard(time.Now().In(m.cfg.Location()))
 }
 

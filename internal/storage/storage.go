@@ -3,8 +3,10 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/csv"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -65,6 +67,13 @@ type Activity struct {
 	Title     string
 	Details   string
 	CreatedAt time.Time
+}
+
+// ImportResult summarizes a CSV import operation.
+type ImportResult struct {
+	Created int
+	Skipped int
+	Errors  []string
 }
 
 var (
@@ -290,6 +299,38 @@ func (s *Store) AccountByName(ctx context.Context, name string) (*Account, error
 	return &account, nil
 }
 
+// AccountByID retrieves an account by its identifier.
+func (s *Store) AccountByID(ctx context.Context, id int64) (*Account, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, phone, address, email, decision_maker, creator, created_at FROM accounts WHERE id = ?`, id)
+	account, err := scanAccount(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get account: %w", err)
+	}
+	return &account, nil
+}
+
+// UpdateAccount persists changes to an existing account.
+func (s *Store) UpdateAccount(ctx context.Context, a *Account) error {
+	if a == nil {
+		return fmt.Errorf("nil account")
+	}
+	if strings.TrimSpace(a.Name) == "" {
+		return fmt.Errorf("account name required")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET name = ?, phone = ?, address = ?, email = ?, decision_maker = ? WHERE id = ?`,
+		strings.TrimSpace(a.Name), nullString(a.Phone), nullString(a.Address), nullString(a.Email), nullString(a.DecisionMaker), a.ID)
+	if err != nil {
+		if isUniqueConstraint(err) {
+			return ErrAccountExists
+		}
+		return fmt.Errorf("update account: %w", err)
+	}
+	return nil
+}
+
 // ListEvents fetches events sorted by event_time ascending.
 func (s *Store) ListEvents(ctx context.Context) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT e.id, e.title, e.details, e.event_time, e.account_id, e.creator, e.created_at, a.name
@@ -363,6 +404,140 @@ func (s *Store) ListActivities(ctx context.Context, limit int) ([]Activity, erro
 	return activities, nil
 }
 
+// ListAccountActivity returns activity related to a specific account.
+func (s *Store) ListAccountActivity(ctx context.Context, accountID int64, limit int) ([]Activity, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT type, id, title, details, created_at FROM (
+            SELECT 'account' AS type, id, name AS title, phone AS details, created_at FROM accounts WHERE id = ?
+            UNION ALL
+            SELECT 'note' AS type, id, substr(content, 1, 80) AS title, '' AS details, created_at FROM notes WHERE account_id = ?
+            UNION ALL
+            SELECT 'event' AS type, id, title, substr(details, 1, 80) AS details, created_at FROM events WHERE account_id = ?
+        ) ORDER BY created_at DESC LIMIT ?`, accountID, accountID, accountID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query account activity: %w", err)
+	}
+	defer rows.Close()
+
+	var activities []Activity
+	for rows.Next() {
+		var a Activity
+		var created string
+		var details sql.NullString
+		if err := rows.Scan(&a.Type, &a.ID, &a.Title, &details, &created); err != nil {
+			return nil, fmt.Errorf("scan activity: %w", err)
+		}
+		a.Details = nullStringToString(details)
+		if t, err := time.Parse(time.RFC3339, created); err == nil {
+			a.CreatedAt = t
+		}
+		activities = append(activities, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return activities, nil
+}
+
+// ImportAccountsCSV ingests accounts from a CSV reader.
+func (s *Store) ImportAccountsCSV(ctx context.Context, r io.Reader, defaultCreator string, loc *time.Location) (ImportResult, error) {
+	result := ImportResult{}
+	reader := csv.NewReader(r)
+	reader.TrimLeadingSpace = true
+	reader.FieldsPerRecord = -1
+	header, err := reader.Read()
+	if err != nil {
+		return result, fmt.Errorf("read header: %w", err)
+	}
+	index := map[string]int{}
+	for i, h := range header {
+		key := strings.ToLower(strings.TrimSpace(h))
+		if key != "" {
+			index[key] = i
+		}
+	}
+	nameIdx, ok := index["name"]
+	if !ok {
+		return result, fmt.Errorf("csv missing 'name' column")
+	}
+	locUsed := loc
+	if locUsed == nil {
+		locUsed = time.Local
+	}
+	row := 1
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("row %d: %v", row+1, err))
+			continue
+		}
+		row++
+		if nameIdx >= len(record) {
+			result.Errors = append(result.Errors, fmt.Sprintf("row %d: missing name field", row))
+			result.Skipped++
+			continue
+		}
+		name := strings.TrimSpace(record[nameIdx])
+		if name == "" {
+			result.Errors = append(result.Errors, fmt.Sprintf("row %d: account name required", row))
+			result.Skipped++
+			continue
+		}
+		account := Account{Name: name}
+		if idx, ok := index["phone"]; ok && idx < len(record) {
+			account.Phone = strings.TrimSpace(record[idx])
+		}
+		if idx, ok := index["address"]; ok && idx < len(record) {
+			account.Address = strings.TrimSpace(record[idx])
+		}
+		if idx, ok := index["email"]; ok && idx < len(record) {
+			account.Email = strings.TrimSpace(record[idx])
+		}
+		if idx, ok := index["decision_maker"]; ok && idx < len(record) {
+			account.DecisionMaker = strings.TrimSpace(record[idx])
+		}
+		creator := defaultCreator
+		if idx, ok := index["creator"]; ok && idx < len(record) {
+			val := strings.TrimSpace(record[idx])
+			if val != "" {
+				creator = val
+			}
+		}
+		if creator == "" {
+			creator = "Import"
+		}
+		account.Creator = creator
+		if idx, ok := index["created_at"]; ok && idx < len(record) {
+			stamp := strings.TrimSpace(record[idx])
+			if stamp != "" {
+				if parsed, ok := parseImportTime(stamp, locUsed); ok {
+					account.CreatedAt = parsed
+				}
+			}
+		}
+		if account.CreatedAt.IsZero() {
+			account.CreatedAt = time.Now().In(locUsed)
+		}
+		if err := s.CreateAccount(ctx, &account); err != nil {
+			if errors.Is(err, ErrAccountExists) {
+				result.Skipped++
+				result.Errors = append(result.Errors, fmt.Sprintf("row %d: duplicate account '%s'", row, account.Name))
+				continue
+			}
+			result.Errors = append(result.Errors, fmt.Sprintf("row %d: %v", row, err))
+			result.Skipped++
+			continue
+		}
+		result.Created++
+	}
+	return result, nil
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -391,6 +566,24 @@ func nullStringToString(ns sql.NullString) string {
 		return ns.String
 	}
 	return ""
+}
+
+func parseImportTime(value string, loc *time.Location) (time.Time, bool) {
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04",
+		"2006-01-02",
+	}
+	for _, layout := range layouts {
+		if t, err := time.ParseInLocation(layout, value, loc); err == nil {
+			return t, true
+		}
+	}
+	if t, err := time.Parse(time.RFC1123, value); err == nil {
+		return t.In(loc), true
+	}
+	return time.Time{}, false
 }
 
 func nullString(s string) interface{} {
