@@ -121,9 +121,8 @@ internal/
 
 ## Roadmap
 - 🔄 Remote sync targets (configure a sync URL in Settings).
-- 🧱 Account detail pane with per-account note/event timelines.
-- 🔔 Reminders for upcoming events (local notifications when possible).
 - 📦 Installer tooling (Homebrew, Scoop, MSI) for easier distribution.
+- 📱 Application for iOS/Android
 
 ## Contributing
 Found a bug or want to help shape the roadmap? Feel free to open an issue or submit a PR. Ideas especially welcome around:
